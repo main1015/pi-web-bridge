@@ -1,0 +1,8 @@
+{
+  "name": "Pi Web",
+  "description": "Minimal, real-time web interface for the Pi coding agent with live tool execution, workspace explorer, and interactive shell.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
