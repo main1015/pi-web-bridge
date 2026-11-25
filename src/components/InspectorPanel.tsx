@@ -2,18 +2,27 @@ import { useEffect, useRef, useState } from 'react';
 import {
   AtSign,
   Check,
+  Cpu,
   FileCode2,
   Loader2,
   Play,
+  RefreshCw,
   Save,
   ShieldCheck,
   Terminal,
   Trash2,
   X,
 } from 'lucide-react';
-import type { ShellHistoryEntry, ToolName } from '../types/pi';
+import type {
+  EngineMode,
+  EngineStatus,
+  ModelSettings,
+  ShellHistoryEntry,
+  ThinkingOption,
+  ToolName,
+} from '../types/pi';
 
-export type InspectorTab = 'file' | 'shell' | 'tools';
+export type InspectorTab = 'file' | 'shell' | 'model' | 'tools';
 
 interface InspectorPanelProps {
   activeTab: InspectorTab;
@@ -31,6 +40,11 @@ interface InspectorPanelProps {
   shellRunning: boolean;
   onRunShell: (command: string) => Promise<void>;
   onClearShell: () => void;
+  // Model settings state
+  modelSettings: ModelSettings;
+  onChangeModelSettings: (next: Partial<ModelSettings>) => void;
+  engineStatus: EngineStatus | null;
+  onRefreshEngineStatus: (piCommand?: string) => Promise<void>;
   // Tools & instructions state
   enabledTools: ToolName[];
   onToggleTool: (tool: ToolName) => void;
@@ -43,11 +57,33 @@ const ALL_TOOL_INFO: Array<{ name: ToolName; title: string; desc: string; catego
   { name: 'read', title: 'read', desc: '读取工作区文件内容与指定行范围', category: '核心工具' },
   { name: 'write', title: 'write', desc: '创建新文件或覆写完整文件内容', category: '核心工具' },
   { name: 'edit', title: 'edit', desc: '精确局部替换文件代码片段', category: '核心工具' },
-  { name: 'bash', title: 'bash', desc: '在沙箱工作区执行终端脚本与测试', category: '核心工具' },
+  { name: 'bash', title: 'bash', desc: '在工作区执行终端脚本与测试', category: '核心工具' },
   { name: 'grep', title: 'grep', desc: '跨文件检索关键词或正则表达式', category: '辅助检索' },
   { name: 'find', title: 'find', desc: '按路径或文件名快速定位工作区文件', category: '辅助检索' },
   { name: 'ls', title: 'ls', desc: '列出目录结构与文件大小', category: '辅助检索' },
 ];
+
+const ENGINE_OPTIONS: Array<{ id: EngineMode; title: string; desc: string }> = [
+  {
+    id: 'gemini',
+    title: '内置 Gemini',
+    desc: '直接调用服务端 GEMINI_API_KEY',
+  },
+  {
+    id: 'openai-compat',
+    title: 'OpenAI 兼容 / Ollama',
+    desc: '支持本地 Ollama、LM Studio 或自定义接口',
+  },
+  {
+    id: 'pi-rpc',
+    title: '本地 Pi CLI (RPC)',
+    desc: '桥接本机安装的 pi --mode rpc 进程',
+  },
+];
+
+const GEMINI_PRESETS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+const OPENAI_PRESETS = ['qwen2.5-coder:14b', 'deepseek-coder-v2', 'gpt-4o'];
+const PI_PRESETS = ['claude-sonnet-4-5', 'gpt-4o', 'gemini-2.5-pro'];
 
 export function InspectorPanel({
   activeTab,
@@ -63,6 +99,10 @@ export function InspectorPanel({
   shellRunning,
   onRunShell,
   onClearShell,
+  modelSettings,
+  onChangeModelSettings,
+  engineStatus,
+  onRefreshEngineStatus,
   enabledTools,
   onToggleTool,
   onApplyToolPreset,
@@ -73,6 +113,7 @@ export function InspectorPanel({
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [checkingEngine, setCheckingEngine] = useState(false);
 
   const [shellInput, setShellInput] = useState('');
   const [cmdHistoryIdx, setCmdHistoryIdx] = useState(-1);
@@ -130,13 +171,30 @@ export function InspectorPanel({
     }
   };
 
+  const handleSwitchEngine = (engine: EngineMode) => {
+    if (engine === modelSettings.engine) return;
+    const defaultModel =
+      engine === 'gemini'
+        ? 'gemini-4-hydrogen'
+        : engine === 'openai-compat'
+        ? 'qwen2.5-coder:14b'
+        : 'claude-sonnet-4-5';
+    onChangeModelSettings({ engine, model: defaultModel });
+  };
+
   const lines = draft.split('\n');
+  const modelPresets =
+    modelSettings.engine === 'gemini'
+      ? GEMINI_PRESETS
+      : modelSettings.engine === 'openai-compat'
+      ? OPENAI_PRESETS
+      : PI_PRESETS;
 
   return (
     <aside className="w-full lg:w-[440px] xl:w-[480px] shrink-0 border-l border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 flex flex-col h-full overflow-hidden">
       {/* Inspector Tab Strip */}
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50">
-        <div className="flex items-center gap-1 p-0.5 bg-slate-200/70 dark:bg-slate-800 rounded-lg">
+        <div className="flex items-center gap-1 p-0.5 bg-slate-200/70 dark:bg-slate-800 rounded-lg overflow-x-auto">
           <button
             type="button"
             onClick={() => onChangeTab('file')}
@@ -147,7 +205,7 @@ export function InspectorPanel({
             }`}
           >
             <FileCode2 className="w-3.5 h-3.5" />
-            <span>文件检查</span>
+            <span>文件</span>
           </button>
           <button
             type="button"
@@ -159,7 +217,19 @@ export function InspectorPanel({
             }`}
           >
             <Terminal className="w-3.5 h-3.5" />
-            <span>Web 终端</span>
+            <span>终端</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeTab('model')}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'model'
+                ? 'bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+            }`}
+          >
+            <Cpu className="w-3.5 h-3.5" />
+            <span>模型设置</span>
           </button>
           <button
             type="button"
@@ -171,7 +241,7 @@ export function InspectorPanel({
             }`}
           >
             <ShieldCheck className="w-3.5 h-3.5" />
-            <span>工具权限</span>
+            <span>工具</span>
           </button>
         </div>
 
@@ -180,7 +250,7 @@ export function InspectorPanel({
             type="button"
             onClick={onClose}
             aria-label="关闭检查面板"
-            className="p-1.5 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-200/60 dark:hover:bg-slate-800 transition-colors"
+            className="p-1.5 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-200/60 dark:hover:bg-slate-800 transition-colors shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -197,7 +267,7 @@ export function InspectorPanel({
                 未选择工作区文件
               </p>
               <p className="text-xs mt-1 max-w-xs leading-relaxed">
-                在左侧工作区点击任意文件即可实时预览、在线编辑，或查看 Pi 工具修改后的代码。
+                在左侧工作区点击任意文件即可实时预览、在线编辑，或查看工具修改后的代码。
               </p>
             </div>
           ) : (
@@ -300,7 +370,7 @@ export function InspectorPanel({
         <div className="flex-1 flex flex-col min-h-0">
           <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-800 text-xs">
             <span className="text-slate-600 dark:text-slate-400 font-mono">
-              cwd: ./pi-workspace
+              cwd: workspace
             </span>
             <div className="flex items-center gap-1.5">
               <button
@@ -332,7 +402,10 @@ export function InspectorPanel({
               </div>
             ) : (
               shellHistory.map((entry) => (
-                <div key={entry.id} className="space-y-1.5 pb-3 border-b border-slate-800/80 last:border-b-0">
+                <div
+                  key={entry.id}
+                  className="space-y-1.5 pb-3 border-b border-slate-800/80 last:border-b-0"
+                >
                   <div className="flex items-center justify-between gap-2 text-slate-400">
                     <div className="text-slate-100 font-semibold break-all">
                       <span className="text-emerald-400 mr-1.5">$</span>
@@ -376,7 +449,257 @@ export function InspectorPanel({
         </div>
       )}
 
-      {/* Tab 3: Tool Allowlist (--tools) & System Prompt */}
+      {/* Tab 3: Model & Engine Settings */}
+      {activeTab === 'model' && (
+        <div className="flex-1 overflow-y-auto p-4 space-y-5">
+          {/* Engine Mode Selector */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                执行引擎
+              </h3>
+              <button
+                type="button"
+                disabled={checkingEngine}
+                onClick={async () => {
+                  setCheckingEngine(true);
+                  try {
+                    await onRefreshEngineStatus(modelSettings.piCommand);
+                  } finally {
+                    setCheckingEngine(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white transition-colors"
+              >
+                <RefreshCw className={`w-3 h-3 ${checkingEngine ? 'animate-spin' : ''}`} />
+                <span>检测环境</span>
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {ENGINE_OPTIONS.map((opt) => {
+                const active = modelSettings.engine === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => handleSwitchEngine(opt.id)}
+                    className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                      active
+                        ? 'border-slate-900 dark:border-slate-100 bg-slate-50 dark:bg-slate-900'
+                        : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        {opt.title}
+                      </span>
+                      {opt.id === 'pi-rpc' && engineStatus && (
+                        <span
+                          className={`text-[11px] font-medium ${
+                            engineStatus.piCliAvailable
+                              ? 'text-emerald-700 dark:text-emerald-400'
+                              : 'text-amber-600 dark:text-amber-400'
+                          }`}
+                        >
+                          {engineStatus.piCliAvailable
+                            ? `已检测到 (${engineStatus.piVersion})`
+                            : '未检测到 pi 命令'}
+                        </span>
+                      )}
+                      {opt.id === 'gemini' && engineStatus && (
+                        <span
+                          className={`text-[11px] font-medium ${
+                            engineStatus.geminiConfigured
+                              ? 'text-emerald-700 dark:text-emerald-400'
+                              : 'text-amber-600 dark:text-amber-400'
+                          }`}
+                        >
+                          {engineStatus.geminiConfigured ? 'GEMINI_API_KEY 已就绪' : '未配置密钥'}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{opt.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Model Name Input + Quick Presets */}
+          <div>
+            <label
+              htmlFor="model-id-input"
+              className="block text-xs font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+            >
+              模型名称 (Model ID)
+            </label>
+            <input
+              id="model-id-input"
+              type="text"
+              value={modelSettings.model}
+              onChange={(e) => onChangeModelSettings({ model: e.target.value })}
+              placeholder="输入任意模型 ID..."
+              className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400"
+            />
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {modelPresets.map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => onChangeModelSettings({ model: preset })}
+                  className={`px-2 py-1 text-[11px] font-mono rounded border transition-colors ${
+                    modelSettings.model === preset
+                      ? 'border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-950'
+                      : 'border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* OpenAI-Compatible Base URL */}
+          {modelSettings.engine === 'openai-compat' && (
+            <div>
+              <label
+                htmlFor="base-url-input"
+                className="block text-xs font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+              >
+                接口 Base URL
+              </label>
+              <input
+                id="base-url-input"
+                type="text"
+                value={modelSettings.baseUrl}
+                onChange={(e) => onChangeModelSettings({ baseUrl: e.target.value })}
+                placeholder="http://localhost:11434/v1"
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    onChangeModelSettings({ baseUrl: 'http://localhost:11434/v1' })
+                  }
+                  className="px-2 py-1 text-[11px] rounded border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  Ollama (:11434)
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onChangeModelSettings({ baseUrl: 'http://localhost:1234/v1' })
+                  }
+                  className="px-2 py-1 text-[11px] rounded border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  LM Studio (:1234)
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1.5 leading-relaxed">
+                本地 Ollama 无需密钥；若连接远端兼容接口，可在服务端 <code className="font-mono">.env</code> 中设置 <code className="font-mono">OPENAI_API_KEY</code>。
+              </p>
+            </div>
+          )}
+
+          {/* Pi CLI RPC Bridge Options */}
+          {modelSettings.engine === 'pi-rpc' && (
+            <div className="space-y-3">
+              <div>
+                <label
+                  htmlFor="pi-cmd-input"
+                  className="block text-xs font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+                >
+                  Pi 可执行命令
+                </label>
+                <input
+                  id="pi-cmd-input"
+                  type="text"
+                  value={modelSettings.piCommand}
+                  onChange={(e) => onChangeModelSettings({ piCommand: e.target.value })}
+                  placeholder="pi"
+                  className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="pi-provider-input"
+                  className="block text-xs font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+                >
+                  Provider（可选，如 anthropic / openai / google / ollama）
+                </label>
+                <input
+                  id="pi-provider-input"
+                  type="text"
+                  value={modelSettings.piProvider}
+                  onChange={(e) => onChangeModelSettings({ piProvider: e.target.value })}
+                  placeholder="留空则使用 Pi 默认配置"
+                  className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400"
+                />
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                该模式通过 <code className="font-mono">pi --mode rpc</code> 直接驱动你本机安装的官方 <code className="font-mono">@mariozechner/pi-coding-agent</code>，复用你本地的 Pi 配置、扩展与凭证。
+              </p>
+            </div>
+          )}
+
+          {/* Thinking Level */}
+          <div>
+            <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 mb-1.5">
+              思考深度 (Thinking Level)
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              {(['LOW', 'MEDIUM', 'HIGH'] as ThinkingOption[]).map((lvl) => {
+                const active = modelSettings.thinkingLevel === lvl;
+                const label = lvl === 'LOW' ? '低 (LOW)' : lvl === 'MEDIUM' ? '中 (MEDIUM)' : '高 (HIGH)';
+                return (
+                  <button
+                    key={lvl}
+                    type="button"
+                    onClick={() => onChangeModelSettings({ thinkingLevel: lvl })}
+                    className={`px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors ${
+                      active
+                        ? 'border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-950'
+                        : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Max Steps */}
+          {modelSettings.engine !== 'pi-rpc' && (
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label
+                  htmlFor="max-steps-range"
+                  className="text-xs font-semibold text-slate-800 dark:text-slate-200"
+                >
+                  单轮最大工具调用步数
+                </label>
+                <span className="text-xs font-mono tabular-nums text-slate-600 dark:text-slate-400">
+                  {modelSettings.maxSteps} 步
+                </span>
+              </div>
+              <input
+                id="max-steps-range"
+                type="range"
+                min={1}
+                max={30}
+                value={modelSettings.maxSteps}
+                onChange={(e) => onChangeModelSettings({ maxSteps: Number(e.target.value) })}
+                className="w-full accent-slate-900 dark:accent-slate-100"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab 4: Tool Allowlist (--tools) & System Prompt */}
       {activeTab === 'tools' && (
         <div className="flex-1 overflow-y-auto p-4 space-y-5">
           <div>
@@ -452,7 +775,7 @@ export function InspectorPanel({
               工作区附加指令 (AGENTS.md)
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">
-              追加到 Pi 系统提示词末尾的自定义规范或编码风格要求。
+              追加到系统提示词末尾的自定义规范或编码风格要求。
             </p>
             <textarea
               rows={4}

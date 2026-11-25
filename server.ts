@@ -3,7 +3,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
-import { runAgentStream } from './server/agent.ts';
+import { detectEnginesStatus, runAgentStream } from './server/agent.ts';
 import { deleteSession, getSession, listSessions, saveSession } from './server/sessions.ts';
 import {
   WORKSPACE_ROOT,
@@ -18,6 +18,7 @@ import {
 } from './server/workspace.ts';
 import type {
   ChatMessage,
+  EngineMode,
   ModelOption,
   SessionRecord,
   ThinkingOption,
@@ -247,7 +248,15 @@ app.delete('/api/sessions/:id', (req, res) => {
   res.json({ ok });
 });
 
-// --- Agent Streaming & Abort APIs ---
+// --- Engine Detection & Agent Streaming APIs ---
+app.get('/api/engines/status', async (req, res) => {
+  const piCommand = typeof req.query.piCommand === 'string' && req.query.piCommand.trim()
+    ? req.query.piCommand.trim()
+    : 'pi';
+  const status = await detectEnginesStatus(piCommand);
+  res.json(status);
+});
+
 app.post('/api/agent/abort', (req, res) => {
   const { runId } = req.body as { runId?: string };
   if (runId && activeRuns.has(runId)) {
@@ -262,16 +271,26 @@ app.post('/api/agent/abort', (req, res) => {
 app.post('/api/agent/stream', async (req, res) => {
   const {
     runId,
+    engine = 'gemini',
     messages,
     model = 'gemini-4-hydrogen',
     thinkingLevel = 'HIGH',
+    maxSteps = 12,
+    baseUrl,
+    piCommand,
+    piProvider,
     enabledTools = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'],
     customInstruction,
   } = req.body as {
     runId?: string;
+    engine?: EngineMode;
     messages?: ChatMessage[];
     model?: ModelOption;
     thinkingLevel?: ThinkingOption;
+    maxSteps?: number;
+    baseUrl?: string;
+    piCommand?: string;
+    piProvider?: string;
     enabledTools?: ToolName[];
     customInstruction?: string;
   };
@@ -303,9 +322,14 @@ app.post('/api/agent/stream', async (req, res) => {
 
   try {
     await runAgentStream({
+      engine,
       messages,
       model,
       thinkingLevel,
+      maxSteps,
+      baseUrl,
+      piCommand,
+      piProvider,
       enabledTools,
       customInstruction,
       signal: controller.signal,

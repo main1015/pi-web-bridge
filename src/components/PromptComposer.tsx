@@ -3,13 +3,14 @@ import {
   ArrowUp,
   AtSign,
   CornerDownLeft,
+  Cpu,
   FileCode2,
   Shield,
   Slash,
   Square,
   X,
 } from 'lucide-react';
-import type { ModelOption, ThinkingOption, ToolName } from '../types/pi';
+import type { EngineMode, ThinkingOption, ToolName } from '../types/pi';
 
 interface SlashCommandItem {
   command: string;
@@ -20,6 +21,7 @@ interface SlashCommandItem {
 const SLASH_COMMANDS: SlashCommandItem[] = [
   { command: '/new', label: '/new', description: '开始一个全新的会话' },
   { command: '/clear', label: '/clear', description: '清空当前对话消息' },
+  { command: '/model', label: '/model', description: '打开模型与引擎设置面板' },
   { command: '/readonly', label: '/readonly', description: '切换只读模式 (read, grep, find, ls)' },
   { command: '/full', label: '/full', description: '启用全部 7 个核心与辅助工具' },
   { command: '/test', label: '/test', description: '让 Pi 运行测试并分析结果' },
@@ -38,11 +40,12 @@ interface PromptComposerProps {
   onAbort: () => void;
   onSteer: () => void;
   onRunSlashCommand: (command: string) => void;
-  model: ModelOption;
-  onChangeModel: (model: ModelOption) => void;
+  engine: EngineMode;
+  model: string;
   thinkingLevel: ThinkingOption;
   onChangeThinkingLevel: (level: ThinkingOption) => void;
   enabledTools: ToolName[];
+  onOpenModelTab: () => void;
   onOpenToolsTab: () => void;
 }
 
@@ -58,23 +61,22 @@ export function PromptComposer({
   onAbort,
   onSteer,
   onRunSlashCommand,
+  engine,
   model,
-  onChangeModel,
   thinkingLevel,
   onChangeThinkingLevel,
   enabledTools,
+  onOpenModelTab,
   onOpenToolsTab,
 }: PromptComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [selectedMenuIdx, setSelectedMenuIdx] = useState(0);
 
-  // Detect "/" command menu when input starts with "/"
   const showSlashMenu = input.startsWith('/') && !input.includes(' ') && !input.includes('\n');
   const filteredCommands = showSlashMenu
     ? SLASH_COMMANDS.filter((c) => c.command.startsWith(input.toLowerCase()))
     : [];
 
-  // Detect "@" mention menu at trailing token
   const atMatch = !showSlashMenu ? /(?:^|\s)@([^\s@]*)$/.exec(input) : null;
   const showAtMenu = Boolean(atMatch);
   const atQuery = atMatch ? atMatch[1].toLowerCase() : '';
@@ -86,7 +88,6 @@ export function PromptComposer({
     setSelectedMenuIdx(0);
   }, [input]);
 
-  // Auto-resize textarea cleanly
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -141,9 +142,11 @@ export function PromptComposer({
     }
   };
 
+  const engineLabel =
+    engine === 'pi-rpc' ? 'pi-rpc' : engine === 'openai-compat' ? 'openai' : 'gemini';
+
   return (
     <div className="relative">
-      {/* Slash Command Popover */}
       {showSlashMenu && filteredCommands.length > 0 && (
         <div className="absolute bottom-full left-0 right-0 mb-2 border border-slate-200 dark:border-slate-800 rounded-xl bg-white dark:bg-slate-900 shadow-lg overflow-hidden z-20">
           <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
@@ -172,7 +175,6 @@ export function PromptComposer({
         </div>
       )}
 
-      {/* @ File Mention Popover */}
       {showAtMenu && filteredFiles.length > 0 && (
         <div className="absolute bottom-full left-0 right-0 mb-2 border border-slate-200 dark:border-slate-800 rounded-xl bg-white dark:bg-slate-900 shadow-lg overflow-hidden z-20">
           <div className="px-3 py-1.5 border-b border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
@@ -199,9 +201,7 @@ export function PromptComposer({
         </div>
       )}
 
-      {/* Composer Box */}
       <div className="border border-slate-200 dark:border-slate-800 rounded-xl bg-white dark:bg-slate-900 shadow-xs focus-within:border-slate-400 dark:focus-within:border-slate-600 transition-colors">
-        {/* Attached Files Row */}
         {attachedFiles.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2.5">
             {attachedFiles.map((filePath) => (
@@ -238,18 +238,19 @@ export function PromptComposer({
           className="w-full px-3.5 pt-3 pb-2 bg-transparent text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 resize-none focus:outline-none leading-relaxed"
         />
 
-        {/* Composer Bottom Controls */}
         <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-2.5 pt-1 border-t border-slate-100 dark:border-slate-800/80">
           <div className="flex items-center gap-2 flex-wrap">
-            <select
-              aria-label="选择模型"
-              value={model}
-              onChange={(e) => onChangeModel(e.target.value as ModelOption)}
-              className="text-xs font-mono bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-md px-2 py-1 focus:outline-none"
+            <button
+              type="button"
+              onClick={onOpenModelTab}
+              className="inline-flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 hover:bg-slate-200/70 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 max-w-[220px]"
+              title="点击修改引擎与模型配置"
             >
-              <option value="gemini-4-hydrogen">gemini-4-hydrogen</option>
-              <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-            </select>
+              <Cpu className="w-3 h-3 text-slate-500 shrink-0" />
+              <span className="truncate">
+                {engineLabel} · {model}
+              </span>
+            </button>
 
             <select
               aria-label="思考深度"

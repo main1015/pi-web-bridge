@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import {
   GoogleGenAI,
   ThinkingLevel,
@@ -9,11 +10,13 @@ import {
 import type {
   ChatMessage,
   DiffLine,
-  ModelOption,
+  EngineMode,
+  EngineStatus,
   ThinkingOption,
   ToolName,
 } from '../src/types/pi.ts';
 import {
+  WORKSPACE_ROOT,
   editWorkspaceFile,
   findWorkspaceFiles,
   grepWorkspace,
@@ -168,6 +171,95 @@ const TOOL_DECLARATIONS: Record<ToolName, FunctionDeclaration> = {
   },
 };
 
+function toOpenAITools(enabledTools: ToolName[]) {
+  const schemaMap: Record<ToolName, { description: string; parameters: Record<string, unknown> }> = {
+    read: {
+      description: TOOL_DECLARATIONS.read.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Relative path to the file inside workspace.' },
+          offset: { type: 'integer', description: '1-based start line.' },
+          limit: { type: 'integer', description: 'Max lines.' },
+        },
+        required: ['path'],
+      },
+    },
+    write: {
+      description: TOOL_DECLARATIONS.write.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          content: { type: 'string' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+    edit: {
+      description: TOOL_DECLARATIONS.edit.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          oldText: { type: 'string' },
+          newText: { type: 'string' },
+        },
+        required: ['path', 'oldText', 'newText'],
+      },
+    },
+    bash: {
+      description: TOOL_DECLARATIONS.bash.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+        },
+        required: ['command'],
+      },
+    },
+    grep: {
+      description: TOOL_DECLARATIONS.grep.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string' },
+          path: { type: 'string' },
+        },
+        required: ['pattern'],
+      },
+    },
+    find: {
+      description: TOOL_DECLARATIONS.find.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string' },
+          path: { type: 'string' },
+        },
+      },
+    },
+    ls: {
+      description: TOOL_DECLARATIONS.ls.description || '',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+        },
+      },
+    },
+  };
+
+  return enabledTools.map((name) => ({
+    type: 'function',
+    function: {
+      name,
+      description: schemaMap[name].description,
+      parameters: schemaMap[name].parameters,
+    },
+  }));
+}
+
 function mapThinkingLevel(level: ThinkingOption): ThinkingLevel {
   if (level === 'LOW') return ThinkingLevel.LOW;
   if (level === 'MEDIUM') return ThinkingLevel.MEDIUM;
@@ -191,25 +283,29 @@ function buildSystemInstruction(enabledTools: ToolName[], customInstruction?: st
     .join('\n');
 }
 
+function formatUserPromptWithFiles(msg: ChatMessage): string {
+  let text = msg.content;
+  if (msg.attachedFiles && msg.attachedFiles.length > 0) {
+    const snippets: string[] = [];
+    for (const filePath of msg.attachedFiles) {
+      try {
+        const { numbered } = readWorkspaceFile(filePath, 1, 250);
+        snippets.push(`<attached_file path="${filePath}">\n${numbered}\n</attached_file>`);
+      } catch {
+        snippets.push(`<attached_file path="${filePath}">[File unavailable]</attached_file>`);
+      }
+    }
+    text = `${snippets.join('\n\n')}\n\n${text}`;
+  }
+  return text;
+}
+
 function buildInitialContents(messages: ChatMessage[]): Content[] {
   const contents: Content[] = [];
   for (const msg of messages) {
     if (msg.role === 'system') continue;
     if (msg.role === 'user') {
-      let text = msg.content;
-      if (msg.attachedFiles && msg.attachedFiles.length > 0) {
-        const snippets: string[] = [];
-        for (const filePath of msg.attachedFiles) {
-          try {
-            const { numbered } = readWorkspaceFile(filePath, 1, 250);
-            snippets.push(`<attached_file path="${filePath}">\n${numbered}\n</attached_file>`);
-          } catch {
-            snippets.push(`<attached_file path="${filePath}">[File unavailable]</attached_file>`);
-          }
-        }
-        text = `${snippets.join('\n\n')}\n\n${text}`;
-      }
-      contents.push({ role: 'user', parts: [{ text }] });
+      contents.push({ role: 'user', parts: [{ text: formatUserPromptWithFiles(msg) }] });
     } else if (msg.role === 'assistant' && msg.content.trim()) {
       contents.push({ role: 'model', parts: [{ text: msg.content }] });
     }
@@ -325,49 +421,101 @@ async function executeTool(
   }
 }
 
+export async function detectEnginesStatus(piCommand = 'pi'): Promise<EngineStatus> {
+  const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
+  const openaiKeyConfigured = Boolean(process.env.OPENAI_API_KEY);
+
+  const piCheck = await new Promise<{ available: boolean; version?: string }>((resolve) => {
+    try {
+      const child = spawn(piCommand, ['--version'], {
+        cwd: WORKSPACE_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve({ available: false });
+      }, 1500);
+
+      child.stdout.on('data', (d: Buffer) => {
+        out += d.toString('utf8');
+      });
+      child.on('error', () => {
+        clearTimeout(timer);
+        resolve({ available: false });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve({ available: true, version: out.trim() || 'installed' });
+        } else {
+          resolve({ available: false });
+        }
+      });
+    } catch {
+      resolve({ available: false });
+    }
+  });
+
+  return {
+    piCliAvailable: piCheck.available,
+    piVersion: piCheck.version,
+    geminiConfigured,
+    openaiKeyConfigured,
+  };
+}
+
 export interface AgentRunParams {
+  engine?: EngineMode;
   messages: ChatMessage[];
-  model: ModelOption;
+  model: string;
   thinkingLevel: ThinkingOption;
+  maxSteps?: number;
+  baseUrl?: string;
+  piCommand?: string;
+  piProvider?: string;
   enabledTools: ToolName[];
   customInstruction?: string;
   signal: AbortSignal;
   emit: (event: string, data: unknown) => void;
 }
 
-export async function runAgentStream(params: AgentRunParams): Promise<void> {
-  const { messages, model, thinkingLevel, enabledTools, customInstruction, signal, emit } = params;
+async function runGeminiAgentStream(params: AgentRunParams): Promise<void> {
+  const {
+    messages,
+    model,
+    thinkingLevel,
+    maxSteps = 12,
+    enabledTools,
+    customInstruction,
+    signal,
+    emit,
+  } = params;
   const ai = getAiClient();
 
-  const functionDeclarations = enabledTools
-    .map((t) => TOOL_DECLARATIONS[t])
-    .filter(Boolean);
-
+  const functionDeclarations = enabledTools.map((t) => TOOL_DECLARATIONS[t]).filter(Boolean);
   const contents = buildInitialContents(messages);
   const systemInstruction = buildSystemInstruction(enabledTools, customInstruction);
 
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  const clampedSteps = Math.min(Math.max(1, maxSteps), 30);
 
-  const MAX_STEPS = 12;
-
-  for (let step = 0; step < MAX_STEPS; step++) {
+  for (let step = 0; step < clampedSteps; step++) {
     if (signal.aborted) {
       emit('done', { aborted: true });
       return;
     }
 
     const stream = await ai.models.generateContentStream({
-      model,
+      model: model || 'gemini-4-hydrogen',
       contents,
       config: {
         systemInstruction,
         thinkingConfig: {
           thinkingLevel: mapThinkingLevel(thinkingLevel),
         },
-        ...(functionDeclarations.length > 0
-          ? { tools: [{ functionDeclarations }] }
-          : {}),
+        ...(functionDeclarations.length > 0 ? { tools: [{ functionDeclarations }] } : {}),
       },
     });
 
@@ -387,7 +535,6 @@ export async function runAgentStream(params: AgentRunParams): Promise<void> {
 
       const candidateParts = chunk.candidates?.[0]?.content?.parts ?? [];
       for (const part of candidateParts) {
-        // Stream thought vs text deltas to client
         if (part.thought && part.text) {
           emit('thought_delta', { text: part.text });
         } else if (part.text) {
@@ -403,7 +550,6 @@ export async function runAgentStream(params: AgentRunParams): Promise<void> {
             name: part.functionCall.name as ToolName,
             args: (part.functionCall.args as Record<string, unknown>) ?? {},
           });
-          // Ensure id is preserved on the part
           assembledParts.push({
             ...part,
             functionCall: {
@@ -447,7 +593,6 @@ export async function runAgentStream(params: AgentRunParams): Promise<void> {
       return;
     }
 
-    // Execute requested tools sequentially and stream progress live
     const functionResponseParts: Part[] = [];
     let anyWorkspaceMutated = false;
 
@@ -517,4 +662,431 @@ export async function runAgentStream(params: AgentRunParams): Promise<void> {
     },
   });
   emit('done', { aborted: false });
+}
+
+interface OpenAIMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+}
+
+async function runOpenAICompatStream(params: AgentRunParams): Promise<void> {
+  const {
+    messages,
+    model,
+    baseUrl = 'http://localhost:11434/v1',
+    maxSteps = 12,
+    enabledTools,
+    customInstruction,
+    signal,
+    emit,
+  } = params;
+
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  const endpoint = cleanBase.endsWith('/chat/completions')
+    ? cleanBase
+    : `${cleanBase}/chat/completions`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const chatMessages: OpenAIMessage[] = [
+    { role: 'system', content: buildSystemInstruction(enabledTools, customInstruction) },
+  ];
+
+  for (const m of messages) {
+    if (m.role === 'user') {
+      chatMessages.push({ role: 'user', content: formatUserPromptWithFiles(m) });
+    } else if (m.role === 'assistant' && m.content.trim()) {
+      chatMessages.push({ role: 'assistant', content: m.content });
+    }
+  }
+
+  const tools = enabledTools.length > 0 ? toOpenAITools(enabledTools) : undefined;
+  const clampedSteps = Math.min(Math.max(1, maxSteps), 30);
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
+  for (let step = 0; step < clampedSteps; step++) {
+    if (signal.aborted) {
+      emit('done', { aborted: true });
+      return;
+    }
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      signal,
+      body: JSON.stringify({
+        model,
+        messages: chatMessages,
+        stream: true,
+        ...(tools ? { tools } : {}),
+      }),
+    });
+
+    if (!res.ok || !res.body) {
+      const errBody = await res.text();
+      throw new Error(`OpenAI-compatible endpoint error (${res.status}): ${errBody}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let assistantText = '';
+    const toolCallMap = new Map<
+      number,
+      { id: string; name: string; argumentsText: string }
+    >();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) continue;
+        const payloadStr = line.slice(5).trim();
+        if (payloadStr === '[DONE]') continue;
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(payloadStr);
+        } catch {
+          continue;
+        }
+
+        const usage = parsed.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
+        if (usage) {
+          totalInputTokens = usage.prompt_tokens ?? totalInputTokens;
+          totalOutputTokens += usage.completion_tokens ?? 0;
+        }
+
+        const choices = parsed.choices as Array<{
+          delta?: {
+            content?: string;
+            reasoning_content?: string;
+            tool_calls?: Array<{
+              index?: number;
+              id?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+        }> | undefined;
+
+        const delta = choices?.[0]?.delta;
+        if (!delta) continue;
+
+        if (delta.reasoning_content) {
+          emit('thought_delta', { text: delta.reasoning_content });
+        }
+        if (delta.content) {
+          assistantText += delta.content;
+          emit('text_delta', { text: delta.content });
+        }
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            const existing = toolCallMap.get(idx) ?? {
+              id: tc.id || `call_${Date.now()}_${idx}`,
+              name: '',
+              argumentsText: '',
+            };
+            if (tc.id) existing.id = tc.id;
+            if (tc.function?.name) existing.name += tc.function.name;
+            if (tc.function?.arguments) existing.argumentsText += tc.function.arguments;
+            toolCallMap.set(idx, existing);
+          }
+        }
+      }
+    }
+
+    const calls = Array.from(toolCallMap.values()).filter((c) => c.name);
+    if (calls.length === 0) {
+      emit('turn_done', {
+        usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+      });
+      emit('done', { aborted: false });
+      return;
+    }
+
+    chatMessages.push({
+      role: 'assistant',
+      content: assistantText || null,
+      tool_calls: calls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: c.argumentsText || '{}' },
+      })),
+    });
+
+    let anyMutated = false;
+    for (const c of calls) {
+      if (signal.aborted) {
+        emit('done', { aborted: true });
+        return;
+      }
+      let parsedArgs: Record<string, unknown> = {};
+      try {
+        parsedArgs = JSON.parse(c.argumentsText || '{}');
+      } catch {
+        parsedArgs = {};
+      }
+      const toolName = c.name as ToolName;
+      const startTime = Date.now();
+      emit('tool_start', { id: c.id, name: toolName, args: parsedArgs });
+
+      const toolRes = enabledTools.includes(toolName)
+        ? await executeTool(toolName, parsedArgs, signal)
+        : {
+            output: `Tool "${toolName}" is disabled by the active session allowlist.`,
+            status: 'error' as const,
+            mutated: false,
+          };
+
+      if (toolRes.mutated) anyMutated = true;
+
+      emit('tool_end', {
+        id: c.id,
+        name: toolName,
+        status: toolRes.status,
+        result: toolRes.output,
+        diff: toolRes.diff,
+        durationMs: Date.now() - startTime,
+      });
+
+      chatMessages.push({
+        role: 'tool',
+        tool_call_id: c.id,
+        content: toolRes.output,
+      });
+    }
+
+    if (anyMutated) {
+      emit('workspace_changed', {});
+    }
+  }
+
+  emit('turn_done', {
+    usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+  });
+  emit('done', { aborted: false });
+}
+
+async function runPiRpcStream(params: AgentRunParams): Promise<void> {
+  const {
+    messages,
+    model,
+    thinkingLevel,
+    piCommand = 'pi',
+    piProvider,
+    enabledTools,
+    customInstruction,
+    signal,
+    emit,
+  } = params;
+
+  const latestUser = [...messages].reverse().find((m) => m.role === 'user');
+  if (!latestUser) {
+    emit('done', { aborted: false });
+    return;
+  }
+
+  const promptText = formatUserPromptWithFiles(latestUser);
+  const cliArgs = ['--mode', 'rpc'];
+  if (piProvider && model) {
+    cliArgs.push('--model', `${piProvider}/${model}`);
+  } else if (model) {
+    cliArgs.push('--model', model);
+  }
+  cliArgs.push('--thinking', thinkingLevel.toLowerCase());
+  if (enabledTools.length > 0) {
+    cliArgs.push('--tools', enabledTools.join(','));
+  } else {
+    cliArgs.push('--no-tools');
+  }
+  if (customInstruction?.trim()) {
+    cliArgs.push('--append-system-prompt', customInstruction.trim());
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(piCommand, cliArgs, {
+      cwd: WORKSPACE_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    let settled = false;
+    const toolTimers = new Map<string, number>();
+
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+
+    const onAbort = () => {
+      try {
+        child.stdin.write(JSON.stringify({ type: 'abort' }) + '\n');
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        if (!settled) {
+          child.kill('SIGTERM');
+          emit('done', { aborted: true });
+          finish();
+        }
+      }, 300);
+    };
+
+    if (signal.aborted) {
+      child.kill('SIGTERM');
+      emit('done', { aborted: true });
+      finish();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    child.on('error', (err) => {
+      finish(
+        new Error(
+          `无法启动本地 pi CLI (${piCommand})：${err.message}。请确认已安装 @mariozechner/pi-coding-agent（npm i -g @mariozechner/pi-coding-agent）或切换回内置引擎。`
+        )
+      );
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBuf += chunk.toString('utf8');
+    });
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBuf += chunk.toString('utf8');
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop() ?? '';
+
+      for (const raw of lines) {
+        const line = raw.replace(/\r$/, '').trim();
+        if (!line) continue;
+
+        let evt: Record<string, unknown>;
+        try {
+          evt = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        const type = String(evt.type ?? '');
+        if (type === 'response' && evt.success === false) {
+          emit('error', { message: String(evt.error || 'pi RPC command failed') });
+        } else if (type === 'message_update') {
+          const ae = (evt.assistantMessageEvent as Record<string, unknown>) || evt;
+          const aeType = String(ae.type ?? '');
+          if (aeType === 'text_delta' && typeof ae.delta === 'string') {
+            emit('text_delta', { text: ae.delta });
+          } else if (aeType === 'thinking_delta' && typeof ae.delta === 'string') {
+            emit('thought_delta', { text: ae.delta });
+          } else if (typeof evt.delta === 'string') {
+            emit('text_delta', { text: evt.delta });
+          }
+        } else if (type === 'tool_execution_start') {
+          const id = String(evt.toolCallId || `pi_${Date.now()}`);
+          const name = String(evt.toolName || evt.tool || 'bash') as ToolName;
+          toolTimers.set(id, Date.now());
+          emit('tool_start', {
+            id,
+            name,
+            args: (evt.args as Record<string, unknown>) ?? {},
+          });
+        } else if (type === 'tool_execution_end') {
+          const id = String(evt.toolCallId || '');
+          const name = String(evt.toolName || evt.tool || 'bash') as ToolName;
+          const start = toolTimers.get(id);
+          const isErr = Boolean(evt.isError);
+          let resultText = '';
+          const resObj = evt.result as { content?: Array<{ text?: string }> } | string | undefined;
+          if (typeof resObj === 'string') {
+            resultText = resObj;
+          } else if (resObj && Array.isArray(resObj.content)) {
+            resultText = resObj.content.map((c) => c.text ?? '').join('\n');
+          } else if (evt.result !== undefined) {
+            resultText = JSON.stringify(evt.result, null, 2);
+          }
+
+          emit('tool_end', {
+            id,
+            name,
+            status: isErr ? 'error' : 'done',
+            result: resultText,
+            durationMs: start ? Date.now() - start : undefined,
+          });
+          if (name === 'write' || name === 'edit' || name === 'bash') {
+            emit('workspace_changed', {});
+          }
+        } else if (type === 'agent_end' || type === 'agent_settled') {
+          if (type === 'agent_settled' || evt.willRetry === false) {
+            emit('done', { aborted: signal.aborted });
+            try {
+              child.stdin.end();
+              child.kill('SIGTERM');
+            } catch {
+              // ignore
+            }
+            finish();
+          }
+        }
+      }
+    });
+
+    child.on('close', (code) => {
+      if (!settled) {
+        if (code && code !== 0 && stderrBuf.trim()) {
+          emit('error', { message: stderrBuf.trim() });
+        }
+        emit('done', { aborted: signal.aborted });
+        finish();
+      }
+    });
+
+    // Send prompt command over stdin JSONL
+    child.stdin.write(
+      JSON.stringify({
+        id: `prompt_${Date.now()}`,
+        type: 'prompt',
+        message: promptText,
+      }) + '\n'
+    );
+  });
+}
+
+export async function runAgentStream(params: AgentRunParams): Promise<void> {
+  const engine = params.engine || 'gemini';
+  if (engine === 'openai-compat') {
+    await runOpenAICompatStream(params);
+    return;
+  }
+  if (engine === 'pi-rpc') {
+    await runPiRpcStream(params);
+    return;
+  }
+  await runGeminiAgentStream(params);
 }

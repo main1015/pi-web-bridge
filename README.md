@@ -14,6 +14,11 @@
   左侧提供多会话历史与工作区文件树（支持新建/删除文件及切换 Node.js / Python / 空白示例模板）；右侧支持代码预览、在线编辑保存（`Cmd/Ctrl + S`）。
 - **内置 Web 终端**
   无需切换回本地命令行，直接在右侧 **Web 终端**面板运行测试或 Shell 脚本（支持 `↑` / `↓` 历史命令）。
+- **多种执行引擎与页面内模型设置**
+  可在右侧「模型设置」面板（或点击输入框左下角模型标签 / 输入 `/model`）直接修改，无需改代码：
+  - **内置 Gemini**：开箱即用，支持自由指定任意 Gemini 模型 ID、思考深度（LOW/MEDIUM/HIGH）及最大工具步数。
+  - **OpenAI 兼容 / Ollama**：可配置本地 Ollama (`http://localhost:11434/v1`)、LM Studio 或兼容 `/chat/completions` 接口与模型名称。
+  - **本地 Pi CLI 桥接 (`pi --mode rpc`)**：如果本机安装了官方 `pi`（`@mariozechner/pi-coding-agent`），可直接通过 JSONL RPC 协议桥接驱动本地 `pi` 进程，复用你本机的 Provider、模型与扩展配置。
 - **工具权限控制与快捷操作**
   - 右侧**工具权限**面板可一键切换「完整代理」「只读审查（`read, grep, find, ls`）」「纯对话」，也可自定义附加指令（`AGENTS.md`）。
   - 输入框支持 `/` 快捷命令菜单与 `@` 工作区文件引用补全。

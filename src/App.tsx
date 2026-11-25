@@ -18,11 +18,11 @@ import { Sidebar } from './components/Sidebar';
 import { ToolCallBlock } from './components/ToolCallBlock';
 import type {
   ChatMessage,
-  ModelOption,
+  EngineStatus,
+  ModelSettings,
   SessionRecord,
   SessionSummary,
   ShellHistoryEntry,
-  ThinkingOption,
   ToolCallEvent,
   ToolName,
   WorkspaceFileNode,
@@ -31,6 +31,28 @@ import type {
 
 const ALL_TOOLS: ToolName[] = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'];
 const READONLY_TOOLS: ToolName[] = ['read', 'grep', 'find', 'ls'];
+
+const DEFAULT_MODEL_SETTINGS: ModelSettings = {
+  engine: 'gemini',
+  model: 'gemini-4-hydrogen',
+  thinkingLevel: 'HIGH',
+  maxSteps: 12,
+  baseUrl: 'http://localhost:11434/v1',
+  piCommand: 'pi',
+  piProvider: '',
+};
+
+function loadSavedModelSettings(): ModelSettings {
+  try {
+    const raw = localStorage.getItem('pi_model_settings');
+    if (raw) {
+      return { ...DEFAULT_MODEL_SETTINGS, ...JSON.parse(raw) };
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_MODEL_SETTINGS;
+}
 
 const STARTER_PROMPTS = [
   {
@@ -51,15 +73,20 @@ const STARTER_PROMPTS = [
   },
 ];
 
-function createEmptySession(): SessionRecord {
+function createEmptySession(settings: ModelSettings): SessionRecord {
   const now = Date.now();
   return {
     id: `sess_${now}_${Math.random().toString(36).slice(2, 7)}`,
     title: '新会话',
     createdAt: now,
     updatedAt: now,
-    model: 'gemini-4-hydrogen',
-    thinkingLevel: 'HIGH',
+    engine: settings.engine,
+    model: settings.model,
+    thinkingLevel: settings.thinkingLevel,
+    maxSteps: settings.maxSteps,
+    baseUrl: settings.baseUrl,
+    piCommand: settings.piCommand,
+    piProvider: settings.piProvider,
     enabledTools: [...ALL_TOOLS],
     messages: [],
   };
@@ -93,7 +120,6 @@ function ThoughtSection({ thinking, streaming }: { thinking: string; streaming: 
 }
 
 export default function App() {
-  // Theme state
   const [isDark, setIsDark] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return localStorage.getItem('pi_theme') === 'dark';
@@ -104,16 +130,18 @@ export default function App() {
     localStorage.setItem('pi_theme', isDark ? 'dark' : 'light');
   }, [isDark]);
 
-  // Layout panel visibility
   const [showSidebar, setShowSidebar] = useState(true);
   const [showInspector, setShowInspector] = useState(true);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('file');
 
-  // Sessions & active session
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [activeSession, setActiveSession] = useState<SessionRecord>(() => createEmptySession());
+  const [modelSettings, setModelSettings] = useState<ModelSettings>(() => loadSavedModelSettings());
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
 
-  // Workspace files & open file state
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [activeSession, setActiveSession] = useState<SessionRecord>(() =>
+    createEmptySession(loadSavedModelSettings())
+  );
+
   const [fileTree, setFileTree] = useState<WorkspaceFileNode[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
@@ -123,20 +151,49 @@ export default function App() {
   );
   const [fileLoading, setFileLoading] = useState(false);
 
-  // Composer & agent streaming state
   const [input, setInput] = useState('');
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
   const [customInstruction, setCustomInstruction] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  // Shell state
   const [shellHistory, setShellHistory] = useState<ShellHistoryEntry[]>([]);
   const [shellRunning, setShellRunning] = useState(false);
 
   const activeRunIdRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const handleChangeModelSettings = useCallback((patch: Partial<ModelSettings>) => {
+    setModelSettings((prev) => {
+      const next = { ...prev, ...patch };
+      localStorage.setItem('pi_model_settings', JSON.stringify(next));
+      setActiveSession((s) => ({
+        ...s,
+        engine: next.engine,
+        model: next.model,
+        thinkingLevel: next.thinkingLevel,
+        maxSteps: next.maxSteps,
+        baseUrl: next.baseUrl,
+        piCommand: next.piCommand,
+        piProvider: next.piProvider,
+      }));
+      return next;
+    });
+  }, []);
+
+  const refreshEngineStatus = useCallback(async (piCmd?: string) => {
+    try {
+      const q = piCmd ? `?piCommand=${encodeURIComponent(piCmd)}` : '';
+      const res = await fetch(`/api/engines/status${q}`);
+      if (res.ok) {
+        const data = (await res.json()) as EngineStatus;
+        setEngineStatus(data);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -146,7 +203,7 @@ export default function App() {
         setSessions(data.sessions || []);
       }
     } catch {
-      // ignore transient error
+      // ignore
     }
   }, []);
 
@@ -207,6 +264,7 @@ export default function App() {
   useEffect(() => {
     refreshSessions();
     refreshWorkspaceTree();
+    refreshEngineStatus(modelSettings.piCommand);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -247,7 +305,6 @@ export default function App() {
     }
   }, []);
 
-  // Global Esc to abort active agent loop (just like Pi TUI)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && isStreaming) {
@@ -276,7 +333,8 @@ export default function App() {
         thinking: '',
         toolCalls: [],
         timestamp: Date.now(),
-        model: sessionSnapshot.model,
+        model: modelSettings.model,
+        engine: modelSettings.engine,
       };
 
       const messagesWithPlaceholder = [...sessionSnapshot.messages, initialAssistant];
@@ -307,9 +365,14 @@ export default function App() {
           signal: controller.signal,
           body: JSON.stringify({
             runId,
+            engine: modelSettings.engine,
             messages: sessionSnapshot.messages,
-            model: sessionSnapshot.model,
-            thinkingLevel: sessionSnapshot.thinkingLevel,
+            model: modelSettings.model,
+            thinkingLevel: modelSettings.thinkingLevel,
+            maxSteps: modelSettings.maxSteps,
+            baseUrl: modelSettings.baseUrl,
+            piCommand: modelSettings.piCommand,
+            piProvider: modelSettings.piProvider,
             enabledTools: sessionSnapshot.enabledTools,
             customInstruction: customInstruction.trim() || undefined,
           }),
@@ -419,7 +482,7 @@ export default function App() {
         await persistSession(latestSession);
       }
     },
-    [customInstruction, persistSession, refreshWorkspaceTree]
+    [customInstruction, modelSettings, persistSession, refreshWorkspaceTree]
   );
 
   const handleSend = useCallback(
@@ -461,7 +524,6 @@ export default function App() {
     if (!steerText && attachedFiles.length === 0) return;
     await handleAbort();
     setTimeout(() => {
-      // Re-send as steering message right after aborting
       const userMsg: ChatMessage = {
         id: `msg_${Date.now()}_steer`,
         role: 'user',
@@ -487,10 +549,10 @@ export default function App() {
     if (isStreaming) {
       void handleAbort();
     }
-    setActiveSession(createEmptySession());
+    setActiveSession(createEmptySession(modelSettings));
     setAttachedFiles([]);
     setErrorBanner(null);
-  }, [handleAbort, isStreaming]);
+  }, [handleAbort, isStreaming, modelSettings]);
 
   const handleSelectSession = useCallback(
     async (id: string) => {
@@ -511,11 +573,11 @@ export default function App() {
     async (id: string) => {
       await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (activeSession.id === id) {
-        setActiveSession(createEmptySession());
+        setActiveSession(createEmptySession(modelSettings));
       }
       refreshSessions();
     },
-    [activeSession.id, refreshSessions]
+    [activeSession.id, modelSettings, refreshSessions]
   );
 
   const handleRunSlashCommand = useCallback(
@@ -527,6 +589,10 @@ export default function App() {
           break;
         case '/clear':
           setActiveSession((prev) => ({ ...prev, messages: [], updatedAt: Date.now() }));
+          break;
+        case '/model':
+          setShowInspector(true);
+          setInspectorTab('model');
           break;
         case '/readonly':
           setActiveSession((prev) => ({ ...prev, enabledTools: [...READONLY_TOOLS] }));
@@ -665,7 +731,6 @@ export default function App() {
     <div className="h-screen w-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 overflow-hidden">
       {/* Strict 3-Zone Top Navigation Bar */}
       <header className="h-13 shrink-0 flex items-center justify-between gap-8 px-4 lg:px-6 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
-        {/* Zone 1: Single-element brand wordmark */}
         <a
           href="/"
           onClick={(e) => {
@@ -677,19 +742,7 @@ export default function App() {
           pi.web
         </a>
 
-        {/* Zone 2: Clean single-line navigation links */}
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
-          <button
-            type="button"
-            onClick={() => setShowSidebar((v) => !v)}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              showSidebar
-                ? 'text-slate-950 dark:text-white border-slate-900 dark:border-slate-100'
-                : 'border-transparent hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            工作区文件
-          </button>
           <button
             type="button"
             onClick={() => {
@@ -722,6 +775,20 @@ export default function App() {
             type="button"
             onClick={() => {
               setShowInspector(true);
+              setInspectorTab('model');
+            }}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              showInspector && inspectorTab === 'model'
+                ? 'text-slate-950 dark:text-white border-slate-900 dark:border-slate-100'
+                : 'border-transparent hover:text-slate-900 dark:hover:text-slate-200'
+            }`}
+          >
+            模型设置
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setShowInspector(true);
               setInspectorTab('tools');
             }}
             className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
@@ -734,7 +801,6 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: Theme toggle + Primary Action */}
         <div className="flex items-center gap-2.5 shrink-0">
           <button
             type="button"
@@ -757,7 +823,6 @@ export default function App() {
 
       {/* Main 3-Pane Workspace */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
-        {/* Left Sidebar */}
         {showSidebar && (
           <Sidebar
             sessions={sessions}
@@ -776,9 +841,7 @@ export default function App() {
           />
         )}
 
-        {/* Center Agent Stream */}
         <main className="flex-1 flex flex-col min-w-0 bg-slate-50 dark:bg-slate-950">
-          {/* Compact Workspace Sub-toolbar */}
           <div className="h-10 shrink-0 flex items-center justify-between px-4 border-b border-slate-200 dark:border-slate-800 bg-white/60 dark:bg-slate-950/60 text-xs text-slate-500 dark:text-slate-400">
             <div className="flex items-center gap-2 min-w-0">
               <button
@@ -793,7 +856,16 @@ export default function App() {
                 {activeSession.title || '新会话'}
               </span>
               <span aria-hidden="true">·</span>
-              <span className="font-mono text-[11px] truncate">{activeSession.model}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowInspector(true);
+                  setInspectorTab('model');
+                }}
+                className="font-mono text-[11px] truncate hover:text-slate-900 dark:hover:text-white underline-offset-2 hover:underline"
+              >
+                {modelSettings.engine} / {modelSettings.model}
+              </button>
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
@@ -814,7 +886,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Conversation Stream Viewport */}
           <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-6">
             <div className="max-w-3xl mx-auto space-y-6">
               {activeSession.messages.length === 0 ? (
@@ -823,7 +894,11 @@ export default function App() {
                     Pi 编码工作台
                   </h1>
                   <p className="mt-2.5 text-sm sm:text-[15px] text-slate-600 dark:text-slate-400 leading-relaxed max-w-2xl">
-                    将 <span className="font-mono text-slate-800 dark:text-slate-200">pi.dev</span> 的核心工作流带入浏览器：支持实时流式工具调用（<span className="font-mono">read</span>、<span className="font-mono">write</span>、<span className="font-mono">edit</span>、<span className="font-mono">bash</span>）、一键只读审查、在线代码 Diff 预览与中途插话引导。
+                    支持内置 Gemini、OpenAI 兼容 / 本地 Ollama，以及直接桥接本机{' '}
+                    <span className="font-mono text-slate-800 dark:text-slate-200">
+                      pi --mode rpc
+                    </span>
+                    。可在右侧「模型设置」自由修改引擎与模型参数。
                   </p>
 
                   <div className="mt-7 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -922,7 +997,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bottom Real-Time Composer */}
           <div className="shrink-0 px-4 sm:px-8 pb-4 pt-2 bg-gradient-to-t from-slate-50 via-slate-50 dark:from-slate-950 dark:via-slate-950 to-transparent">
             <div className="max-w-3xl mx-auto">
               <PromptComposer
@@ -939,13 +1013,17 @@ export default function App() {
                 onAbort={handleAbort}
                 onSteer={handleSteer}
                 onRunSlashCommand={handleRunSlashCommand}
-                model={activeSession.model}
-                onChangeModel={(model) => setActiveSession((prev) => ({ ...prev, model }))}
-                thinkingLevel={activeSession.thinkingLevel}
+                engine={modelSettings.engine}
+                model={modelSettings.model}
+                thinkingLevel={modelSettings.thinkingLevel}
                 onChangeThinkingLevel={(thinkingLevel) =>
-                  setActiveSession((prev) => ({ ...prev, thinkingLevel }))
+                  handleChangeModelSettings({ thinkingLevel })
                 }
                 enabledTools={activeSession.enabledTools}
+                onOpenModelTab={() => {
+                  setShowInspector(true);
+                  setInspectorTab('model');
+                }}
                 onOpenToolsTab={() => {
                   setShowInspector(true);
                   setInspectorTab('tools');
@@ -955,7 +1033,6 @@ export default function App() {
           </div>
         </main>
 
-        {/* Right Inspector Panel */}
         {showInspector && (
           <InspectorPanel
             activeTab={inspectorTab}
@@ -971,6 +1048,10 @@ export default function App() {
             shellRunning={shellRunning}
             onRunShell={handleRunShell}
             onClearShell={() => setShellHistory([])}
+            modelSettings={modelSettings}
+            onChangeModelSettings={handleChangeModelSettings}
+            engineStatus={engineStatus}
+            onRefreshEngineStatus={refreshEngineStatus}
             enabledTools={activeSession.enabledTools}
             onToggleTool={handleToggleTool}
             onApplyToolPreset={handleApplyToolPreset}

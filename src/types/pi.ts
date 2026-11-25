@@ -2,7 +2,26 @@ export type ToolName = 'read' | 'write' | 'edit' | 'bash' | 'grep' | 'find' | 'l
 
 export type ThinkingOption = 'LOW' | 'MEDIUM' | 'HIGH';
 
-export type ModelOption = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
+export type EngineMode = 'gemini' | 'openai-compat' | 'pi-rpc';
+
+export type ModelOption = string;
+
+export interface ModelSettings {
+  engine: EngineMode;
+  model: string;
+  thinkingLevel: ThinkingOption;
+  maxSteps: number;
+  baseUrl: string;
+  piCommand: string;
+  piProvider: string;
+}
+
+export interface EngineStatus {
+  piCliAvailable: boolean;
+  piVersion?: string;
+  geminiConfigured: boolean;
+  openaiKeyConfigured: boolean;
+}
 
 export interface DiffLine {
   type: 'context' | 'add' | 'remove';
@@ -29,7 +48,8 @@ export interface ChatMessage {
   toolCalls?: ToolCallEvent[];
   attachedFiles?: string[];
   timestamp: number;
-  model?: ModelOption;
+  model?: string;
+  engine?: EngineMode;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -42,8 +62,13 @@ export interface SessionRecord {
   title: string;
   createdAt: number;
   updatedAt: number;
-  model: ModelOption;
+  engine?: EngineMode;
+  model: string;
   thinkingLevel: ThinkingOption;
+  maxSteps?: number;
+  baseUrl?: string;
+  piCommand?: string;
+  piProvider?: string;
   enabledTools: ToolName[];
   messages: ChatMessage[];
 }
@@ -54,7 +79,7 @@ export interface SessionSummary {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
-  model: ModelOption;
+  model: string;
 }
 
 export interface WorkspaceFileNode {
