@@ -338,9 +338,11 @@ app.post('/api/agent/stream', async (req, res) => {
     activeRuns.set(runId, controller);
   }
 
-  req.on('close', () => {
-    controller.abort();
-    if (runId) activeRuns.delete(runId);
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+      if (runId) activeRuns.delete(runId);
+    }
   });
 
   const emit = (event: string, data: unknown) => {

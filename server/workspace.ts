@@ -12,7 +12,7 @@ export function setWorkspaceRoot(dir: string): void {
   WORKSPACE_ROOT = path.resolve(dir);
 }
 
-const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__', '.venv']);
+const IGNORED_DIRS = new Set(['node_modules', '.git', '.pi', 'dist', '.next', '__pycache__', '.venv']);
 
 export function resolveSafePath(relPath: string): string {
   const cleaned = (relPath || '.').replace(/^\/+/, '');
@@ -461,7 +461,6 @@ export function runWorkspaceBash(
       cwd: WORKSPACE_ROOT,
       env: {
         ...process.env,
-        HOME: WORKSPACE_ROOT,
       },
     });
 

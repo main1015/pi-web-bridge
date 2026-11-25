@@ -931,6 +931,7 @@ async function runPiRpcStream(params: AgentRunParams): Promise<void> {
     let stdoutBuf = '';
     let stderrBuf = '';
     let settled = false;
+    let streamedTextForTurn = false;
     const toolTimers = new Map<string, number>();
 
     const finish = (err?: Error) => {
@@ -998,15 +999,30 @@ async function runPiRpcStream(params: AgentRunParams): Promise<void> {
         const type = String(evt.type ?? '');
         if (type === 'response' && evt.success === false) {
           emit('error', { message: String(evt.error || 'pi RPC command failed') });
+        } else if (type === 'message_start') {
+          streamedTextForTurn = false;
         } else if (type === 'message_update') {
           const ae = (evt.assistantMessageEvent as Record<string, unknown>) || evt;
           const aeType = String(ae.type ?? '');
           if (aeType === 'text_delta' && typeof ae.delta === 'string') {
+            streamedTextForTurn = true;
             emit('text_delta', { text: ae.delta });
           } else if (aeType === 'thinking_delta' && typeof ae.delta === 'string') {
             emit('thought_delta', { text: ae.delta });
           } else if (typeof evt.delta === 'string') {
+            streamedTextForTurn = true;
             emit('text_delta', { text: evt.delta });
+          }
+        } else if (type === 'message_end' && !streamedTextForTurn) {
+          const msg = evt.message as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+          if (msg?.role === 'assistant' && Array.isArray(msg.content)) {
+            const fullText = msg.content
+              .filter((c) => c.type === 'text' && typeof c.text === 'string')
+              .map((c) => c.text)
+              .join('');
+            if (fullText) {
+              emit('text_delta', { text: fullText });
+            }
           }
         } else if (type === 'tool_execution_start') {
           const id = String(evt.toolCallId || `pi_${Date.now()}`);
@@ -1043,7 +1059,7 @@ async function runPiRpcStream(params: AgentRunParams): Promise<void> {
             emit('workspace_changed', {});
           }
         } else if (type === 'agent_end' || type === 'agent_settled') {
-          if (type === 'agent_settled' || evt.willRetry === false) {
+          if (type === 'agent_settled' || evt.willRetry !== true) {
             emit('done', { aborted: signal.aborted });
             try {
               child.stdin.end();
