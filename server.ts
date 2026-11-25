@@ -3,7 +3,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
-import { detectEnginesStatus, runAgentStream } from './server/agent.ts';
+import { detectEnginesStatus, runAgentStream, testEngineConnection } from './server/agent.ts';
 import { deleteSession, getSession, listSessions, saveSession } from './server/sessions.ts';
 import {
   WORKSPACE_ROOT,
@@ -255,6 +255,34 @@ app.get('/api/engines/status', async (req, res) => {
     : 'pi';
   const status = await detectEnginesStatus(piCommand);
   res.json(status);
+});
+
+app.post('/api/engines/test', async (req, res) => {
+  const {
+    engine = 'gemini',
+    model = 'gemini-4-hydrogen',
+    thinkingLevel = 'LOW',
+    baseUrl,
+    piCommand,
+    piProvider,
+  } = req.body as {
+    engine?: EngineMode;
+    model?: string;
+    thinkingLevel?: ThinkingOption;
+    baseUrl?: string;
+    piCommand?: string;
+    piProvider?: string;
+  };
+
+  const result = await testEngineConnection({
+    engine,
+    model,
+    thinkingLevel,
+    baseUrl,
+    piCommand,
+    piProvider,
+  });
+  res.status(result.ok ? 200 : 400).json(result);
 });
 
 app.post('/api/agent/abort', (req, res) => {

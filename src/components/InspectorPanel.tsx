@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   AtSign,
   Check,
+  CheckCircle2,
   Cpu,
   FileCode2,
   Loader2,
@@ -12,6 +14,7 @@ import {
   Terminal,
   Trash2,
   X,
+  Zap,
 } from 'lucide-react';
 import type {
   EngineMode,
@@ -114,6 +117,13 @@ export function InspectorPanel({
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [checkingEngine, setCheckingEngine] = useState(false);
+  const [testingModel, setTestingModel] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    ok: boolean;
+    latencyMs: number;
+    reply?: string;
+    error?: string;
+  } | null>(null);
 
   const [shellInput, setShellInput] = useState('');
   const [cmdHistoryIdx, setCmdHistoryIdx] = useState(-1);
@@ -127,6 +137,16 @@ export function InspectorPanel({
   useEffect(() => {
     shellEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [shellHistory]);
+
+  useEffect(() => {
+    setTestResult(null);
+  }, [
+    modelSettings.engine,
+    modelSettings.model,
+    modelSettings.baseUrl,
+    modelSettings.piCommand,
+    modelSettings.piProvider,
+  ]);
 
   const isDirty = draft !== fileContent;
 
@@ -180,6 +200,40 @@ export function InspectorPanel({
         ? 'qwen2.5-coder:14b'
         : 'claude-sonnet-4-5';
     onChangeModelSettings({ engine, model: defaultModel });
+  };
+
+  const handleTestConnection = async () => {
+    setTestingModel(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/engines/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engine: modelSettings.engine,
+          model: modelSettings.model,
+          thinkingLevel: modelSettings.thinkingLevel,
+          baseUrl: modelSettings.baseUrl,
+          piCommand: modelSettings.piCommand,
+          piProvider: modelSettings.piProvider,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok: boolean;
+        latencyMs: number;
+        reply?: string;
+        error?: string;
+      };
+      setTestResult(data);
+    } catch (err) {
+      setTestResult({
+        ok: false,
+        latencyMs: 0,
+        error: err instanceof Error ? err.message : '网络请求失败',
+      });
+    } finally {
+      setTestingModel(false);
+    }
   };
 
   const lines = draft.split('\n');
@@ -696,6 +750,62 @@ export function InspectorPanel({
               />
             </div>
           )}
+
+          {/* Connection Test Action & Output */}
+          <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-3">
+            <button
+              type="button"
+              disabled={testingModel || !modelSettings.model.trim()}
+              onClick={handleTestConnection}
+              className="w-full inline-flex items-center justify-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-white disabled:opacity-40 transition-colors"
+            >
+              {testingModel ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>正在发送测试请求...</span>
+                </>
+              ) : (
+                <>
+                  <Zap className="w-3.5 h-3.5" />
+                  <span>测试模型连通性</span>
+                </>
+              )}
+            </button>
+
+            {testResult && (
+              <div
+                className={`p-3 rounded-lg border text-xs space-y-1.5 ${
+                  testResult.ok
+                    ? 'border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300'
+                    : 'border-red-200 dark:border-red-900/60 bg-red-50/70 dark:bg-red-950/30 text-red-700 dark:text-red-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 font-medium">
+                  <span className="inline-flex items-center gap-1.5">
+                    {testResult.ok ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    )}
+                    <span>{testResult.ok ? '连接成功' : '连接失败'}</span>
+                  </span>
+                  <span className="font-mono tabular-nums text-[11px] opacity-80">
+                    {testResult.latencyMs}ms
+                  </span>
+                </div>
+                {testResult.reply && (
+                  <div className="font-mono text-[11px] opacity-90 break-words">
+                    返回：{testResult.reply}
+                  </div>
+                )}
+                {testResult.error && (
+                  <div className="font-mono text-[11px] whitespace-pre-wrap break-words opacity-95">
+                    {testResult.error}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

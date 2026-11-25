@@ -1090,3 +1090,224 @@ export async function runAgentStream(params: AgentRunParams): Promise<void> {
   }
   await runGeminiAgentStream(params);
 }
+
+export interface EngineTestParams {
+  engine: EngineMode;
+  model: string;
+  thinkingLevel?: ThinkingOption;
+  baseUrl?: string;
+  piCommand?: string;
+  piProvider?: string;
+}
+
+export interface EngineTestResult {
+  ok: boolean;
+  engine: EngineMode;
+  model: string;
+  latencyMs: number;
+  reply?: string;
+  error?: string;
+}
+
+export async function testEngineConnection(params: EngineTestParams): Promise<EngineTestResult> {
+  const start = Date.now();
+  const {
+    engine,
+    model,
+    thinkingLevel = 'LOW',
+    baseUrl = 'http://localhost:11434/v1',
+    piCommand = 'pi',
+    piProvider,
+  } = params;
+
+  try {
+    if (engine === 'gemini') {
+      const ai = getAiClient();
+      const targetModel = model || 'gemini-4-hydrogen';
+      const response = await ai.models.generateContent({
+        model: targetModel,
+        contents: 'Reply with OK only.',
+        config: {
+          thinkingConfig: {
+            thinkingLevel: mapThinkingLevel(thinkingLevel),
+          },
+        },
+      });
+      return {
+        ok: true,
+        engine,
+        model: targetModel,
+        latencyMs: Date.now() - start,
+        reply: (response.text ?? '').trim() || 'OK',
+      };
+    }
+
+    if (engine === 'openai-compat') {
+      const cleanBase = baseUrl.replace(/\/+$/, '');
+      const endpoint = cleanBase.endsWith('/chat/completions')
+        ? cleanBase
+        : `${cleanBase}/chat/completions`;
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (process.env.OPENAI_API_KEY) {
+        headers.Authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: 'Reply with OK only.' }],
+            max_tokens: 24,
+            stream: false,
+          }),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
+        }
+        const data = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        const reply = data.choices?.[0]?.message?.content?.trim() || 'OK';
+        return {
+          ok: true,
+          engine,
+          model,
+          latencyMs: Date.now() - start,
+          reply,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // pi-rpc test
+    const reply = await new Promise<string>((resolve, reject) => {
+      const cliArgs = ['--mode', 'rpc', '--no-tools', '--thinking', thinkingLevel.toLowerCase()];
+      if (piProvider && model) {
+        cliArgs.push('--model', `${piProvider}/${model}`);
+      } else if (model) {
+        cliArgs.push('--model', model);
+      }
+
+      const child = spawn(piCommand, cliArgs, {
+        cwd: WORKSPACE_ROOT,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let collected = '';
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          child.kill('SIGKILL');
+          reject(new Error('Pi RPC 测试超时 (15s)'));
+        }
+      }, 15000);
+
+      const doneOk = (text: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          child.stdin.end();
+          child.kill('SIGTERM');
+        } catch {
+          // ignore
+        }
+        resolve(text || 'OK');
+      };
+
+      const doneErr = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+
+      child.on('error', (err) => {
+        doneErr(new Error(`无法启动 "${piCommand}"：${err.message}`));
+      });
+
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrBuf += chunk.toString('utf8');
+      });
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdoutBuf += chunk.toString('utf8');
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop() ?? '';
+
+        for (const raw of lines) {
+          const line = raw.replace(/\r$/, '').trim();
+          if (!line) continue;
+          let evt: Record<string, unknown>;
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const type = String(evt.type ?? '');
+          if (type === 'response' && evt.success === false) {
+            doneErr(new Error(String(evt.error || 'Pi RPC 返回失败')));
+            return;
+          }
+          if (type === 'message_update') {
+            const ae = (evt.assistantMessageEvent as Record<string, unknown>) || evt;
+            if (ae.type === 'text_delta' && typeof ae.delta === 'string') {
+              collected += ae.delta;
+            }
+          } else if (type === 'agent_settled' || (type === 'agent_end' && evt.willRetry === false)) {
+            doneOk(collected.trim());
+            return;
+          }
+        }
+      });
+
+      child.on('close', (code) => {
+        if (!settled) {
+          if (code && code !== 0) {
+            doneErr(new Error(stderrBuf.trim() || `Pi 进程退出码: ${code}`));
+          } else {
+            doneOk(collected.trim());
+          }
+        }
+      });
+
+      child.stdin.write(
+        JSON.stringify({
+          id: `test_${Date.now()}`,
+          type: 'prompt',
+          message: 'Reply with OK only.',
+        }) + '\n'
+      );
+    });
+
+    return {
+      ok: true,
+      engine,
+      model,
+      latencyMs: Date.now() - start,
+      reply,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      engine,
+      model,
+      latencyMs: Date.now() - start,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
